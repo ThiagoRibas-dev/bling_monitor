@@ -8,148 +8,263 @@
 ```
 --- File List and Contents ---
 ```
-File: D:\Projects\bling_monitor\dump_products.py
-import json
-import os
+File: D:\Projects\bling_monitor\bling_api.py
+"""
+Cliente API Bling com retry, rate limiting e tratamento de erros
+"""
 import requests
 import time
+from collections import deque
+from datetime import datetime, timedelta
 
-API_BASE = "https://api.bling.com.br/Api/v3"
-OUTPUT_FILE = "products_dump.json"
 
-def get_all_categories(access_token):
-    headers = {"Authorization": f"Bearer {access_token}"}
-    all_categories = {}
-    page = 1
-    while True:
-        url = f"{API_BASE}/categorias/produtos?pagina={page}&limite=100"
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        categories = data.get("data", [])
-        if not categories:
-            break
-        for cat in categories:
-            all_categories[cat['id']] = cat
-        page += 1
-    print(f"Found {len(all_categories)} categories.")
-    return all_categories
-
-def get_category_prefix(category_name):
-    parts = category_name.split()
-    if len(parts) > 1:
-        return (parts[0][:2] + parts[1][:2]).upper()
-    else:
-        return category_name[:4].upper()
-
-def dump_all_products(access_token):
-    headers = {"Authorization": f"Bearer {access_token}"}
+class RateLimiter:
+    """Controla rate limit de 3 req/s e 120k/dia."""
     
-    print("Fetching all categories...")
-    categories = get_all_categories(access_token)
-    category_counters = {}
-    category_prefixes = {}
+    def __init__(self, requests_per_second=3, requests_per_day=120000):
+        self.rps = requests_per_second
+        self.rpd = requests_per_day
+        
+        # Janela deslizante para req/s
+        self.second_window = deque()
+        
+        # Contador diÃ¡rio
+        self.daily_count = 0
+        self.daily_reset = datetime.now() + timedelta(days=1)
+    
+    def wait_if_needed(self):
+        """Aguarda se necessÃ¡rio para respeitar limites."""
+        now = time.time()
+        
+        # Reset contador diÃ¡rio se necessÃ¡rio
+        if datetime.now() >= self.daily_reset:
+            self.daily_count = 0
+            self.daily_reset = datetime.now() + timedelta(days=1)
+            print(f"ðŸ“Š Rate limit diÃ¡rio resetado")
+        
+        # Verifica limite diÃ¡rio
+        if self.daily_count >= self.rpd:
+            wait_seconds = (self.daily_reset - datetime.now()).total_seconds()
+            print(f"âš ï¸ Limite diÃ¡rio atingido! Aguardando {wait_seconds/3600:.1f} horas...")
+            time.sleep(wait_seconds)
+            self.daily_count = 0
+        
+        # Remove requisiÃ§Ãµes antigas da janela (>1s)
+        while self.second_window and now - self.second_window[0] > 1:
+            self.second_window.popleft()
+        
+        # Se atingiu limite por segundo, aguarda
+        if len(self.second_window) >= self.rps:
+            sleep_time = 1 - (now - self.second_window[0])
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        
+        # Registra requisiÃ§Ã£o
+        self.second_window.append(time.time())
+        self.daily_count += 1
 
-    all_products = []
-    page = 1
 
-    while True:
-        url = f"{API_BASE}/produtos?pagina={page}&limite=100"
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
-        products = data.get("data", [])
-        if not products:
-            break
-
-        for product_summary in products:
-            product_id = product_summary["id"]
-            details_url = f"{API_BASE}/produtos/{product_id}"
-            details_response = requests.get(details_url, headers=headers)
-            details_response.raise_for_status()
-            product_details = details_response.json().get("data", {})
-
-            if 'categoria' not in product_details:
-                continue
-
-            if not product_details['codigo'] and product_details['categoria']['id'] in categories:
-                cat_id = product_details['categoria']['id']
-                cat = categories[cat_id]
-                
-                cat_name = cat_name['nome']
-                if cat_id not in category_counters:
-                    category_counters[cat_id] = 0
-                
-                if cat_id not in category_prefixes:
-                    category_prefixes[cat_id] = get_category_prefix(cat_name)
-
-                category_counters[cat_id] += 1
-                prefix = category_prefixes[cat_id]
-                counter = category_counters[cat_id]
-                
-                product_details['codigo'] = f"{prefix}{counter:05d}"
-            
-            all_products.append(product_details)
-            time.sleep(0.4)
-
-        print(f"Fetched page {page}, total so far: {len(all_products)}")
-        page += 1
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_products, f, ensure_ascii=False, indent=2)
-
-    print(f"\nâœ… Dump saved to {OUTPUT_FILE} ({len(all_products)} products)")
-
-if __name__ == "__main__":
-    TOKEN_FILE = "tokens.json"
-    if not os.path.exists(TOKEN_FILE):
-        print(f"Error: Token file '{TOKEN_FILE}' not found.")
-        print("Please run test.py first to generate the tokens.")
-    else:
-        with open(TOKEN_FILE, 'r') as f:
+class BlingAPI:
+    """Cliente HTTP para API Bling com retry e rate limiting."""
+    
+    BASE_URL = "https://api.bling.com.br/Api/v3"
+    
+    def __init__(self, get_token_func):
+        """
+        Args:
+            get_token_func: FunÃ§Ã£o que retorna access token vÃ¡lido
+        """
+        self.get_token = get_token_func
+        self.rate_limiter = RateLimiter()
+    
+    def _headers(self):
+        """Retorna headers com token atual."""
+        return {
+            "Authorization": f"Bearer {self.get_token()}",
+            "Content-Type": "application/json"
+        }
+    
+    def _request(self, method, endpoint, max_retries=3, **kwargs):
+        """
+        Faz requisiÃ§Ã£o com retry automÃ¡tico e exponential backoff.
+        
+        Args:
+            method: GET, POST, PATCH, DELETE
+            endpoint: Ex: "/produtos" ou "/produtos/123"
+            max_retries: NÃºmero mÃ¡ximo de tentativas
+            **kwargs: Argumentos para requests (params, json, data)
+        """
+        url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
+        
+        for attempt in range(max_retries):
             try:
-                tokens = json.load(f)
-                access_token = tokens.get('access_token')
-                if not access_token:
-                    print("Error: Access token not found in tokens.json.")
-                else:
-                    dump_all_products(access_token)
-            except json.JSONDecodeError:
-                print(f"Error: Could not decode JSON from {TOKEN_FILE}.")
+                # Rate limiting
+                self.rate_limiter.wait_if_needed()
+                
+                # Fazer requisiÃ§Ã£o
+                response = requests.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    timeout=30,
+                    **kwargs
+                )
+                
+                # Tratar erros HTTP
+                if response.status_code == 401:
+                    # Token expirado, forÃ§a refresh e tenta de novo
+                    print("âš ï¸ Token expirado (401), tentando refresh...")
+                    from bling_auth import refresh_access_token
+                    refresh_access_token()
+                    # Retry com novo token (nÃ£o conta como tentativa)
+                    continue
+                
+                elif response.status_code == 429:
+                    # Rate limit excedido
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    print(f"â³ Rate limit (429). Aguardando {retry_after}s...")
+                    time.sleep(retry_after)
+                    continue
+                
+                elif response.status_code >= 500:
+                    # Erro do servidor, retry com backoff
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt  # 1s, 2s, 4s
+                        print(f"âš ï¸ Erro {response.status_code}. Retry {attempt+1}/{max_retries} em {wait}s...")
+                        time.sleep(wait)
+                        continue
+                
+                # Verificar sucesso
+                response.raise_for_status()
+                
+                # Retornar JSON ou dict vazio
+                return response.json() if response.content else {}
+            
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"â±ï¸ Timeout. Retry {attempt+1}/{max_retries} em {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise
+            
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"âš ï¸ Erro de rede: {e}. Retry {attempt+1}/{max_retries} em {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise
+        
+        raise Exception(f"Falhou apÃ³s {max_retries} tentativas")
+    
+    # === Produtos ===
+    
+    def get_products(self, page=1, limit=100, **filters):
+        """Lista produtos com paginaÃ§Ã£o."""
+        params = {"pagina": page, "limite": limit, **filters}
+        return self._request("GET", "/produtos", params=params)
+    
+    def get_product(self, product_id):
+        """ObtÃ©m detalhes de um produto."""
+        return self._request("GET", f"/produtos/{product_id}")
+    
+    def update_product(self, product_id, data):
+        """Atualiza produto (PATCH)."""
+        import json
+        return self._request("PATCH", f"/produtos/{product_id}", data=json.dumps(data))
+    
+    def update_product_situation(self, product_id, situation):
+        """
+        Atualiza situaÃ§Ã£o do produto.
+        situation: 'A' (Ativo) ou 'I' (Inativo)
+        """
+        import json
+        return self._request(
+            "PATCH",
+            f"/produtos/{product_id}/situacoes",
+            data=json.dumps({"situacao": situation})
+        )
+    
+    # === Categorias ===
+    
+    def get_categories(self, page=1, limit=100):
+        """Lista categorias."""
+        params = {"pagina": page, "limite": limit}
+        return self._request("GET", "/categorias/produtos", params=params)
+    
+    def get_all_categories(self):
+        """ObtÃ©m todas as categorias (auto-paginaÃ§Ã£o)."""
+        all_cats = {}
+        page = 1
+        
+        while True:
+            data = self.get_categories(page=page, limit=100)
+            cats = data.get("data", [])
+            
+            if not cats:
+                break
+            
+            for cat in cats:
+                all_cats[cat['id']] = cat
+            
+            page += 1
+        
+        print(f"ðŸ“¦ {len(all_cats)} categorias carregadas")
+        return all_cats
+    
+    # === Estoque ===
+    
+    def get_stock_movements(self, product_id, start_date=None, end_date=None):
+        """
+        ObtÃ©m movimentaÃ§Ãµes de estoque de um produto.
+        
+        Args:
+            product_id: ID do produto
+            start_date: Data inicial (formato YYYY-MM-DD)
+            end_date: Data final (formato YYYY-MM-DD)
+        """
+        params = {"idProduto": product_id}
+        if start_date:
+            params['dataInicial'] = start_date
+        if end_date:
+            params['dataFinal'] = end_date
+        
+        return self._request("GET", "/estoques", params=params)
+    
+    # === Pedidos ===
+    
+    def get_orders(self, page=1, limit=100, **filters):
+        """Lista pedidos de venda."""
+        params = {"pagina": page, "limite": limit, **filters}
+        return self._request("GET", "/pedidos/vendas", params=params)
 ```
 
 ```
-File: D:\Projects\bling_monitor\test.py
+File: D:\Projects\bling_monitor\bling_auth.py
+"""
+MÃ³dulo compartilhado para autenticaÃ§Ã£o OAuth com Bling
+Elimina duplicaÃ§Ã£o de cÃ³digo entre test.py e dump_products.py
+"""
 import requests
 import base64
 import json
 import os
-import time # Import the time module
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-# --- Configuration ---
+# ConfiguraÃ§Ãµes
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")
-# You will only need this AUTH_CODE for the very first run.
-AUTH_CODE = os.getenv("AUTH_CODE")
-MINUTES_BETWEEN_RUNS = int(os.getenv("MINUTES_BETWEEN_RUNS", 5)) # Default to 5 minutes
-
 TOKEN_URL = "https://www.bling.com.br/Api/v3/oauth/token"
-API_BASE = "https://www.bling.com.br/Api/v3"
-
-
 TOKEN_FILE = "tokens.json"
 
-# --- Global State ---
-access_token = None
-refresh_token = None
+# Estado global
+_tokens = None
 
-# --- Helper Functions ---
+
 def get_basic_auth_header():
     """Encodes Client ID and Secret for Basic Auth."""
     auth_string = f"{CLIENT_ID}:{CLIENT_SECRET}"
@@ -159,33 +274,36 @@ def get_basic_auth_header():
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
+
 def save_tokens(tokens):
     """Saves access and refresh tokens to a file."""
-    global access_token, refresh_token
-    access_token = tokens['access_token']
-    refresh_token = tokens['refresh_token']
+    global _tokens
+    _tokens = tokens
     with open(TOKEN_FILE, 'w') as f:
-        json.dump(tokens, f)
-    print("Tokens saved successfully.")
+        json.dump(tokens, f, indent=2)
+    print("âœ… Tokens saved successfully.")
+
 
 def load_tokens():
     """Loads tokens from a file if it exists."""
+    global _tokens
     if not os.path.exists(TOKEN_FILE):
         return None
-    with open(TOKEN_FILE, 'r') as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return None
+    try:
+        with open(TOKEN_FILE, 'r') as f:
+            _tokens = json.load(f)
+            return _tokens
+    except json.JSONDecodeError:
+        return None
 
-# --- API Authentication ---
-def get_initial_token():
+
+def get_initial_token(auth_code):
     """Exchanges the one-time AUTH_CODE for the first token."""
-    print("Attempting to get initial token with AUTH_CODE...")
+    print("ðŸ”‘ Attempting to get initial token with AUTH_CODE...")
     data = {
         "grant_type": "authorization_code",
         "redirect_uri": REDIRECT_URI,
-        "code": AUTH_CODE
+        "code": auth_code
     }
     headers = get_basic_auth_header()
     response = requests.post(TOKEN_URL, headers=headers, data=data)
@@ -193,121 +311,1123 @@ def get_initial_token():
     tokens = response.json()
     save_tokens(tokens)
     return tokens
+
 
 def refresh_access_token():
     """Refreshes the access token using the stored refresh token."""
-    print("Refreshing access token...")
-    global refresh_token
-    if not refresh_token:
-        raise ValueError("No refresh token available.")
-        
+    global _tokens
+    
+    if not _tokens:
+        _tokens = load_tokens()
+    
+    if not _tokens or 'refresh_token' not in _tokens:
+        raise ValueError("No refresh token available. Run with AUTH_CODE first.")
+    
+    print("ðŸ”„ Refreshing access token...")
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": refresh_token
+        "refresh_token": _tokens['refresh_token']
     }
     headers = get_basic_auth_header()
     response = requests.post(TOKEN_URL, headers=headers, data=data)
     response.raise_for_status()
-    tokens = response.json()
-    # Bling might not always return a new refresh token, so we preserve the old one.
-    if 'refresh_token' not in tokens:
-        tokens['refresh_token'] = refresh_token
-    save_tokens(tokens)
-    return tokens
-
-# --- API Core Logic ---
-def get_products(page=1):
-    """Fetches a paginated list of products from the Bling API."""
-    headers = {"Authorization": f"Bearer {access_token}"}
-    url = f"{API_BASE}/produtos?pagina={page}&limite=100"
-    response = requests.get(url, headers=headers)
     
-    if response.status_code == 401:  # Token expired
-        print("Access token expired. Refreshing...")
-        refresh_access_token()
-        headers = {"Authorization": f"Bearer {access_token}"} # Retry with new token
-        response = requests.get(url, headers=headers)
-        
-    response.raise_for_status()
-    return response.json()
+    new_tokens = response.json()
+    # Preserve refresh token if not returned
+    if 'refresh_token' not in new_tokens:
+        new_tokens['refresh_token'] = _tokens['refresh_token']
+    
+    save_tokens(new_tokens)
+    return new_tokens
 
-def update_product(product_id, payload):
-    """Updates a product's information on the Bling API."""
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    url = f"{API_BASE}/produtos/{product_id}"
-    response = requests.patch(url, headers=headers, data=json.dumps(payload))
 
-    if response.status_code == 401:  # Token expired
-        print("Access token expired. Refreshing...")
-        refresh_access_token()
-        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"} # Retry with new token
-        response = requests.patch(url, headers=headers, data=json.dumps(payload))
-        
-    response.raise_for_status()
-    return response.json()
+def get_access_token():
+    """Returns a valid access token, refreshing if necessary."""
+    global _tokens
+    
+    if not _tokens:
+        _tokens = load_tokens()
+    
+    if not _tokens:
+        auth_code = os.getenv("AUTH_CODE")
+        if not auth_code:
+            raise ValueError("No tokens found and no AUTH_CODE in .env")
+        return get_initial_token(auth_code)['access_token']
+    
+    # Try to use current token, refresh if it fails (lazy refresh)
+    return _tokens['access_token']
 
-def find_and_deactivate_first_zero_stock_product():
-    """Finds the first product with zero stock and sets its status to 'Inativo'."""
-    print("\nSearching for the first product with zero stock to deactivate...")
-    page = 1
-    count = 0
-    while True:
-        if count > 100:
-            return #Deal with 100 itens, then returns
 
+def ensure_authenticated():
+    """Ensures valid authentication, returns access token."""
+    try:
+        return get_access_token()
+    except:
+        return refresh_access_token()['access_token']
+```
+
+```
+File: D:\Projects\bling_monitor\bling_db.py
+"""
+MÃ³dulo de persistÃªncia SQLite para contadores de cÃ³digo e cache
+"""
+import sqlite3
+import json
+from datetime import datetime
+from contextlib import contextmanager
+
+
+class BlingDatabase:
+    def __init__(self, db_path="bling_data.db"):
+        self.db_path = db_path
+        self._init_db()
+    
+    @contextmanager
+    def _get_connection(self):
+        """Context manager para conexÃµes SQLite."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row  # Permite acessar colunas por nome
         try:
-            data = get_products(page)
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    
+    def _init_db(self):
+        """Inicializa tabelas do banco de dados."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Tabela de contadores de cÃ³digo
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS code_counters (
+                    prefix TEXT PRIMARY KEY,
+                    last_value INTEGER NOT NULL DEFAULT 0,
+                    category_id INTEGER,
+                    category_name TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            
+            # Tabela de eventos processados (idempotÃªncia webhook)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS processed_events (
+                    event_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    product_id INTEGER,
+                    processed_at TEXT NOT NULL,
+                    payload TEXT
+                )
+            """)
+            
+            # Ãndices
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_product 
+                ON processed_events(product_id)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_type 
+                ON processed_events(event_type)
+            """)
+    
+    def get_next_code(self, prefix, category_id=None, category_name=None):
+        """
+        ObtÃ©m o prÃ³ximo cÃ³digo sequencial para um prefixo.
+        Thread-safe via transaÃ§Ã£o SQLite.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Tenta incrementar existente
+            cursor.execute("""
+                UPDATE code_counters 
+                SET last_value = last_value + 1,
+                    updated_at = ?
+                WHERE prefix = ?
+            """, (datetime.now().isoformat(), prefix))
+            
+            # Se nÃ£o existia, cria
+            if cursor.rowcount == 0:
+                cursor.execute("""
+                    INSERT INTO code_counters 
+                    (prefix, last_value, category_id, category_name, updated_at)
+                    VALUES (?, 1, ?, ?, ?)
+                """, (prefix, category_id, category_name, datetime.now().isoformat()))
+                return f"{prefix}00001"
+            
+            # Busca valor atualizado
+            cursor.execute(
+                "SELECT last_value FROM code_counters WHERE prefix = ?",
+                (prefix,)
+            )
+            row = cursor.fetchone()
+            return f"{prefix}{row['last_value']:05d}"
+    
+    def get_last_code_value(self, prefix):
+        """Retorna o Ãºltimo valor usado para um prefixo."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT last_value FROM code_counters WHERE prefix = ?",
+                (prefix,)
+            )
+            row = cursor.fetchone()
+            return row['last_value'] if row else 0
+    
+    def is_event_processed(self, event_id):
+        """Verifica se um evento webhook jÃ¡ foi processado."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM processed_events WHERE event_id = ? LIMIT 1",
+                (event_id,)
+            )
+            return cursor.fetchone() is not None
+    
+    def mark_event_processed(self, event_id, event_type, product_id=None, payload=None):
+        """Marca um evento como processado."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO processed_events 
+                (event_id, event_type, product_id, processed_at, payload)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                event_id,
+                event_type,
+                product_id,
+                datetime.now().isoformat(),
+                json.dumps(payload) if payload else None
+            ))
+    
+    def get_stats(self):
+        """Retorna estatÃ­sticas do banco."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) as count FROM code_counters")
+            counters_count = cursor.fetchone()['count']
+            
+            cursor.execute("SELECT COUNT(*) as count FROM processed_events")
+            events_count = cursor.fetchone()['count']
+            
+            cursor.execute("""
+                SELECT prefix, last_value, category_name, updated_at 
+                FROM code_counters 
+                ORDER BY updated_at DESC 
+                LIMIT 10
+            """)
+            recent_counters = [dict(row) for row in cursor.fetchall()]
+            
+            return {
+                'counters': counters_count,
+                'events': events_count,
+                'recent_counters': recent_counters
+            }
+```
+
+```
+File: D:\Projects\bling_monitor\dump_products.py
+"""
+Script de geraÃ§Ã£o de cÃ³digos para produtos - COM PERSISTÃŠNCIA
+"""
+import json
+import time
+from datetime import datetime
+
+# Imports dos novos mÃ³dulos
+from bling_auth import ensure_authenticated
+from bling_api import BlingAPI
+from bling_db import BlingDatabase
+
+# Cliente API e Database
+api = BlingAPI(ensure_authenticated)
+db = BlingDatabase()
+
+OUTPUT_FILE = "products_dump.json"
+
+
+def get_category_prefix(category_name):
+    """
+    Gera prefixo de cÃ³digo baseado no nome da categoria.
+    
+    Exemplos:
+        "Teclado Mouse" -> "TEMO"
+        "Placa MÃ£e" -> "PLMA"
+        "Monitor" -> "MONI"
+    """
+    # Remove acentos comuns
+    replacements = {
+        'Ã£': 'a', 'Ã¡': 'a', 'Ã ': 'a', 'Ã¢': 'a',
+        'Ã©': 'e', 'Ãª': 'e',
+        'Ã­': 'i',
+        'Ãµ': 'o', 'Ã³': 'o', 'Ã´': 'o',
+        'Ãº': 'u', 'Ã¼': 'u'
+    }
+    
+    clean_name = category_name.lower()
+    for old, new in replacements.items():
+        clean_name = clean_name.replace(old, new)
+    
+    parts = clean_name.split()
+    
+    if len(parts) > 1:
+        # Pega 2 primeiras letras de cada palavra
+        return (parts[0][:2] + parts[1][:2]).upper()
+    else:
+        # Pega 4 primeiras letras
+        return clean_name[:4].upper()
+
+
+def extract_category_info(product):
+    """
+    Extrai categoria e subcategoria de um produto.
+    
+    Returns:
+        (category_name, subcategory_name, full_hierarchy)
+    """
+    cat_info = product.get('categoria', {})
+    cat_id = cat_info.get('id')
+    full_name = cat_info.get('nome', '')
+    
+    if '>>' in full_name:
+        parts = full_name.split('>>')
+        category = parts[0].strip()
+        subcategory = parts[-1].strip()
+        return category, subcategory, full_name, cat_id
+    else:
+        return full_name, None, full_name, cat_id
+
+
+def should_generate_code(product):
+    """
+    Verifica se deve gerar cÃ³digo para o produto.
+    
+    Returns:
+        (should_generate: bool, reason: str, prefix: str)
+    """
+    # JÃ¡ tem cÃ³digo?
+    if product.get('codigo'):
+        return False, "JÃ¡ possui cÃ³digo", None
+    
+    category, subcategory, full, cat_id = extract_category_info(product)
+    
+    if not category:
+        return False, "Sem categoria", None
+    
+    # SubMaquina: ignorar
+    if subcategory and subcategory.lower() == 'submaquina':
+        return False, "Subcategoria SubMaquina (ignorar)", None
+    
+    if category.lower() == 'submaquina':
+        return False, "Categoria SubMaquina (ignorar)", None
+    
+    # Notebook, Mini, SFF -> NTB
+    if category.lower() in ['notebook', 'mini', 'sff']:
+        return True, f"Categoria {category}", "NTB"
+    
+    # PeÃ§as: usar subcategoria
+    if category.lower() == 'pecas' or 'peÃ§a' in category.lower():
+        if subcategory:
+            prefix = get_category_prefix(subcategory)
+            return True, f"PeÃ§a - Subcategoria {subcategory}", prefix
+        else:
+            return False, "PeÃ§a sem subcategoria", None
+    
+    # Outras categorias: gera prefixo da categoria
+    prefix = get_category_prefix(category)
+    return True, f"Categoria {category}", prefix
+
+
+def generate_and_update_code(product, product_details):
+    """
+    Gera cÃ³digo e atualiza produto na API.
+    
+    Returns:
+        (success: bool, code: str or None, message: str)
+    """
+    product_id = product['id']
+    product_name = product.get('nome', 'Sem nome')
+    
+    should_gen, reason, prefix = should_generate_code(product_details)
+    
+    if not should_gen:
+        return False, None, reason
+    
+    # Gerar cÃ³digo usando banco de dados (thread-safe)
+    category, subcategory, full, cat_id = extract_category_info(product_details)
+    new_code = db.get_next_code(
+        prefix=prefix,
+        category_id=cat_id,
+        category_name=full
+    )
+    
+    print(f"   ðŸ·ï¸  CÃ³digo gerado: {new_code}")
+    
+    # Atualizar na API
+    try:
+        api.update_product(product_id, {"codigo": new_code})
+        return True, new_code, f"Atualizado com sucesso ({reason})"
+    except Exception as e:
+        return False, None, f"Erro ao atualizar: {e}"
+
+
+def process_product_variations(product_details):
+    """
+    Processa variaÃ§Ãµes de produto (se houver).
+    """
+    variations = product_details.get('variacoes', [])
+    
+    if not variations:
+        return
+    
+    print(f"   ðŸ”€ Produto tem {len(variations)} variaÃ§Ãµes")
+    
+    for var in variations:
+        var_id = var.get('id')
+        var_name = var.get('nome', 'Sem nome')
+        var_code = var.get('codigo')
+        
+        if var_code:
+            print(f"      â­ï¸  VariaÃ§Ã£o {var_id} jÃ¡ tem cÃ³digo: {var_code}")
+            continue
+        
+        print(f"      ðŸ” Processando variaÃ§Ã£o: {var_name}")
+        
+        # VariaÃ§Ãµes herdam categoria do produto pai
+        should_gen, reason, prefix = should_generate_code(product_details)
+        
+        if not should_gen:
+            print(f"      â­ï¸  {reason}")
+            continue
+        
+        # Gerar cÃ³digo
+        category, subcategory, full, cat_id = extract_category_info(product_details)
+        new_code = db.get_next_code(
+            prefix=prefix,
+            category_id=cat_id,
+            category_name=full
+        )
+        
+        print(f"      ðŸ·ï¸  CÃ³digo gerado para variaÃ§Ã£o: {new_code}")
+        
+        # Atualizar variaÃ§Ã£o
+        try:
+            # Endpoint de variaÃ§Ãµes
+            api.update_product(var_id, {"codigo": new_code})
+            var['codigo'] = new_code  # Atualiza no dump tambÃ©m
+            print(f"      âœ… VariaÃ§Ã£o atualizada com sucesso")
+        except Exception as e:
+            print(f"      âŒ Erro ao atualizar variaÃ§Ã£o: {e}")
+
+
+def dump_and_update_product_codes():
+    """
+    Varre todos os produtos, gera cÃ³digos e atualiza na API.
+    """
+    print(f"\n{'='*80}")
+    print(f"ðŸš€ INICIANDO GERAÃ‡ÃƒO DE CÃ“DIGOS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*80}\n")
+    
+    all_products = []
+    page = 1
+    total_processed = 0
+    total_updated = 0
+    total_skipped = 0
+    total_errors = 0
+    
+    while True:
+        try:
+            data = api.get_products(page=page, limit=100)
             products = data.get("data", [])
+            
             if not products:
-                print("No more products to check.")
+                break
+            
+            print(f"\n{'â”€'*80}")
+            print(f"ðŸ“„ Processando pÃ¡gina {page} ({len(products)} produtos)")
+            print(f"{'â”€'*80}\n")
+            
+            for product_summary in products:
+                total_processed += 1
+                product_id = product_summary['id']
+                product_name = product_summary.get('nome', 'Sem nome')
+                
+                print(f"\n[{total_processed}] ðŸ“¦ {product_name}")
+                print(f"    ID: {product_id}")
+                
+                # Buscar detalhes completos
+                try:
+                    details_response = api.get_product(product_id)
+                    product_details = details_response.get('data', {})
+                except Exception as e:
+                    print(f"    âŒ Erro ao buscar detalhes: {e}")
+                    total_errors += 1
+                    all_products.append(product_summary)
+                    continue
+                
+                # Gerar e atualizar cÃ³digo
+                success, code, message = generate_and_update_code(product_summary, product_details)
+                
+                if success:
+                    print(f"    âœ… {message}")
+                    product_details['codigo'] = code  # Atualiza no dump
+                    total_updated += 1
+                else:
+                    print(f"    â­ï¸  {message}")
+                    total_skipped += 1
+                
+                # Processar variaÃ§Ãµes
+                process_product_variations(product_details)
+                
+                all_products.append(product_details)
+            
+            page += 1
+        
+        except Exception as e:
+            print(f"\nâŒ Erro na pÃ¡gina {page}: {e}")
+            break
+    
+    # Salvar dump
+    print(f"\nðŸ’¾ Salvando dump em {OUTPUT_FILE}...")
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_products, f, ensure_ascii=False, indent=2)
+    
+    # RelatÃ³rio final
+    print(f"\n{'='*80}")
+    print(f"ðŸ“Š RELATÃ“RIO FINAL")
+    print(f"{'='*80}")
+    print(f"âœ… Produtos processados: {total_processed}")
+    print(f"ðŸ·ï¸  CÃ³digos gerados e atualizados: {total_updated}")
+    print(f"â­ï¸  Ignorados (jÃ¡ tinham cÃ³digo/regra): {total_skipped}")
+    print(f"âŒ Erros: {total_errors}")
+    print(f"ðŸ’¾ Dump salvo: {OUTPUT_FILE}")
+    print(f"{'='*80}\n")
+    
+    # EstatÃ­sticas do banco
+    stats = db.get_stats()
+    print(f"ðŸ“Š ESTATÃSTICAS DO BANCO DE DADOS")
+    print(f"{'='*80}")
+    print(f"Contadores de cÃ³digo cadastrados: {stats['counters']}")
+    print(f"\nÃšltimos contadores usados:")
+    for counter in stats['recent_counters'][:5]:
+        print(f"  â€¢ {counter['prefix']}: {counter['last_value']:05d} ({counter['category_name']})")
+    print(f"{'='*80}\n")
+
+
+if __name__ == "__main__":
+    dump_and_update_product_codes()
+```
+
+```
+File: D:\Projects\bling_monitor\quick_test.py
+"""
+Script de teste rÃ¡pido para validar mÃ³dulos
+"""
+from bling_auth import ensure_authenticated
+from bling_api import BlingAPI
+from bling_db import BlingDatabase
+
+def test_auth():
+    """Testa autenticaÃ§Ã£o."""
+    print("ðŸ”‘ Testando autenticaÃ§Ã£o...")
+    try:
+        token = ensure_authenticated()
+        print(f"âœ… Token obtido: {token[:20]}...")
+        return True
+    except Exception as e:
+        print(f"âŒ Erro: {e}")
+        return False
+
+def test_api():
+    """Testa chamada Ã  API."""
+    print("\nðŸ“¡ Testando API...")
+    try:
+        api = BlingAPI(ensure_authenticated)
+        data = api.get_products(page=1, limit=1)
+        products = data.get('data', [])
+        print(f"âœ… API funcionando. {len(products)} produto(s) retornado(s)")
+        return True
+    except Exception as e:
+        print(f"âŒ Erro: {e}")
+        return False
+
+def test_database():
+    """Testa banco de dados."""
+    print("\nðŸ’¾ Testando banco de dados...")
+    try:
+        db = BlingDatabase()
+        
+        # Testa geraÃ§Ã£o de cÃ³digo
+        code1 = db.get_next_code("TEST", category_id=999, category_name="Teste")
+        code2 = db.get_next_code("TEST", category_id=999, category_name="Teste")
+        
+        assert code1 == "TEST00001", f"CÃ³digo esperado TEST00001, obtido {code1}"
+        assert code2 == "TEST00002", f"CÃ³digo esperado TEST00002, obtido {code2}"
+        
+        # Testa idempotÃªncia
+        db.mark_event_processed("test_event_123", "product.created", 999, {"test": True})
+        assert db.is_event_processed("test_event_123"), "Evento deveria estar marcado"
+        assert not db.is_event_processed("test_event_999"), "Evento nÃ£o deveria estar marcado"
+        
+        print(f"âœ… Banco funcionando corretamente")
+        
+        # Mostra stats
+        stats = db.get_stats()
+        print(f"\nðŸ“Š EstatÃ­sticas:")
+        print(f"   Contadores: {stats['counters']}")
+        print(f"   Eventos: {stats['events']}")
+        
+        return True
+    except Exception as e:
+        print(f"âŒ Erro: {e}")
+        return False
+
+if __name__ == "__main__":
+    print("="*60)
+    print("ðŸ§ª TESTE DE VALIDAÃ‡ÃƒO DOS MÃ“DULOS")
+    print("="*60 + "\n")
+    
+    results = {
+        "AutenticaÃ§Ã£o": test_auth(),
+        "API": test_api(),
+        "Database": test_database()
+    }
+    
+    print("\n" + "="*60)
+    print("ðŸ“Š RESULTADO DOS TESTES")
+    print("="*60)
+    
+    for test, passed in results.items():
+        status = "âœ… PASSOU" if passed else "âŒ FALHOU"
+        print(f"{test}: {status}")
+    
+    all_passed = all(results.values())
+    
+    print("="*60)
+    if all_passed:
+        print("ðŸŽ‰ TODOS OS TESTES PASSARAM!")
+    else:
+        print("âš ï¸  ALGUNS TESTES FALHARAM")
+    print("="*60)
+```
+
+```
+File: D:\Projects\bling_monitor\requirements.txt
+requests==2.31.0
+python-dotenv==1.0.0
+flask==3.0.0
+```
+
+```
+File: D:\Projects\bling_monitor\test.py
+"""
+Script de monitoramento contÃ­nuo - Desativa produtos com estoque zerado POR VENDAS
+"""
+import time
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import os
+
+# Imports dos novos mÃ³dulos
+from bling_auth import ensure_authenticated
+from bling_api import BlingAPI
+
+load_dotenv()
+
+# ConfiguraÃ§Ãµes
+MINUTES_BETWEEN_RUNS = int(os.getenv("MINUTES_BETWEEN_RUNS", 60))  # Aumentado para 1h
+EXCLUDED_CATEGORIES = {"notebook", "sff", "mini", "monitor"}  # lowercase para comparaÃ§Ã£o
+IGNORE_SUBCATEGORIES = {"submaquina"}  # lowercase
+
+# Cliente API
+api = BlingAPI(ensure_authenticated)
+
+
+def extract_category_info(product):
+    """
+    Extrai categoria e subcategoria de um produto.
+    
+    Returns:
+        (category_name, subcategory_name, full_hierarchy)
+    """
+    cat_info = product.get('categoria', {})
+    full_name = cat_info.get('nome', '')
+    
+    if '>>' in full_name:
+        parts = full_name.split('>>')
+        category = parts[0].strip()
+        subcategory = parts[-1].strip()
+        return category, subcategory, full_name
+    else:
+        return full_name, None, full_name
+
+
+def should_ignore_product(product):
+    """
+    Verifica se produto deve ser ignorado baseado em categoria.
+    
+    Returns:
+        (should_ignore: bool, reason: str)
+    """
+    category, subcategory, full = extract_category_info(product)
+    
+    # Verificar categorias excluÃ­das
+    if category.lower() in EXCLUDED_CATEGORIES:
+        return True, f"Categoria excluÃ­da: {category}"
+    
+    # Verificar subcategorias ignoradas
+    if subcategory and subcategory.lower() in IGNORE_SUBCATEGORIES:
+        return True, f"Subcategoria ignorada: {subcategory}"
+    
+    return False, ""
+
+
+def check_stock_depleted_by_sales(product_id):
+    """
+    Verifica se o estoque zerou ESPECIFICAMENTE por vendas.
+    
+    CritÃ©rio: entradas > 0 E entradas == saÃ­das_vinculadas_a_vendas
+    
+    Returns:
+        (is_depleted_by_sales: bool, details: dict)
+    """
+    try:
+        # Buscar movimentaÃ§Ãµes dos Ãºltimos 365 dias
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        
+        response = api.get_stock_movements(
+            product_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        movements = response.get('data', [])
+        
+        if not movements:
+            return False, {
+                'reason': 'Sem movimentaÃ§Ãµes (nunca teve entrada)',
+                'entries': 0,
+                'sales_exits': 0
+            }
+        
+        total_entries = 0
+        total_sales_exits = 0
+        
+        for mov in movements:
+            quantidade = mov.get('quantidade', 0)
+            tipo = mov.get('tipo', '')
+            operacao = mov.get('operacao', '').lower()
+            
+            if tipo == 'E':  # Entrada
+                total_entries += quantidade
+            
+            elif tipo == 'S':  # SaÃ­da
+                # Verificar se Ã© saÃ­da por venda
+                # OperaÃ§Ãµes tÃ­picas: "Venda", "Pedido de Venda", "SaÃ­da por venda"
+                if any(keyword in operacao for keyword in ['venda', 'pedido', 'nfe', 'nota fiscal']):
+                    total_sales_exits += quantidade
+        
+        # CritÃ©rio: teve entradas E elas foram totalmente consumidas por vendas
+        if total_entries > 0 and total_entries == total_sales_exits:
+            return True, {
+                'reason': 'Estoque zerado por vendas',
+                'entries': total_entries,
+                'sales_exits': total_sales_exits
+            }
+        
+        return False, {
+            'reason': 'Entradas nÃ£o batem com saÃ­das por venda' if total_entries > 0 else 'Sem entradas',
+            'entries': total_entries,
+            'sales_exits': total_sales_exits
+        }
+    
+    except Exception as e:
+        print(f"    âš ï¸ Erro ao verificar movimentaÃ§Ãµes: {e}")
+        # Em caso de erro, nÃ£o desativa (conservador)
+        return False, {'reason': f'Erro: {e}', 'entries': 0, 'sales_exits': 0}
+
+
+def process_zero_stock_products():
+    """
+    Processa produtos com estoque zero, desativando apenas os que zeraram por vendas.
+    """
+    print(f"\n{'='*80}")
+    print(f"ðŸ” INICIANDO VARREDURA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*80}\n")
+    
+    page = 1
+    checked_count = 0
+    zero_stock_count = 0
+    deactivated_count = 0
+    ignored_count = 0
+    
+    while True:
+        try:
+            data = api.get_products(page=page, limit=100)
+            products = data.get("data", [])
+            
+            if not products:
                 break
             
             for p in products:
+                checked_count += 1
                 stock = p.get("estoqueAtual", 0)
-                if stock == 0:
-                    product_id = p.get("id")
-                    product_name = p.get("nome")
-                    print(f"Found product with zero stock - ID: {product_id} | Name: {product_name}. Deactivating...")
-                    
-                    # Payload to set product status to 'Desativado'
-                    payload = {"situacao": "I"}
-                    update_product(product_id, payload)
-                    print(f"Product ID: {product_id} | Name: {product_name} has been set to Inativo.")
+                
+                if stock != 0:
+                    continue  # Pula produtos com estoque
+                
+                zero_stock_count += 1
+                product_id = p.get("id")
+                product_name = p.get("nome", "Sem nome")
+                
+                print(f"\nðŸ“¦ Produto com estoque ZERO encontrado:")
+                print(f"   ID: {product_id}")
+                print(f"   Nome: {product_name}")
+                
+                # Buscar detalhes completos
+                try:
+                    details_response = api.get_product(product_id)
+                    product_details = details_response.get("data", {})
+                except Exception as e:
+                    print(f"   âŒ Erro ao buscar detalhes: {e}")
+                    continue
+                
+                # Verificar se deve ignorar
+                should_ignore, ignore_reason = should_ignore_product(product_details)
+                if should_ignore:
+                    ignored_count += 1
+                    print(f"   â­ï¸  IGNORADO: {ignore_reason}")
+                    continue
+                
+                # Verificar se zerou por vendas
+                print(f"   ðŸ” Verificando movimentaÃ§Ãµes de estoque...")
+                is_depleted, details = check_stock_depleted_by_sales(product_id)
+                
+                print(f"   ðŸ“Š Entradas: {details['entries']}")
+                print(f"   ðŸ“Š SaÃ­das por venda: {details['sales_exits']}")
+                print(f"   ðŸ“Š Motivo: {details['reason']}")
+                
+                if is_depleted:
+                    print(f"   ðŸ”´ DESATIVANDO produto...")
+                    try:
+                        api.update_product_situation(product_id, 'I')
+                        deactivated_count += 1
+                        print(f"   âœ… Produto DESATIVADO com sucesso")
+                    except Exception as e:
+                        print(f"   âŒ Erro ao desativar: {e}")
+                else:
+                    print(f"   âœ… Produto NÃƒO serÃ¡ desativado (nÃ£o zerou por vendas)")
             
+            print(f"\nðŸ“„ PÃ¡gina {page} processada ({len(products)} produtos)")
             page += 1
-        except requests.exceptions.HTTPError as e:
-            print(f"An API error occurred: {e}")
+        
+        except Exception as e:
+            print(f"\nâŒ Erro na pÃ¡gina {page}: {e}")
             break
-        count += 1
-# --- Main Execution ---
-if __name__ == "__main__":
+    
+    # RelatÃ³rio final
+    print(f"\n{'='*80}")
+    print(f"ðŸ“Š RELATÃ“RIO FINAL")
+    print(f"{'='*80}")
+    print(f"âœ… Produtos verificados: {checked_count}")
+    print(f"âš ï¸  Com estoque zero: {zero_stock_count}")
+    print(f"â­ï¸  Ignorados (categoria): {ignored_count}")
+    print(f"ðŸ”´ Desativados (zerado por vendas): {deactivated_count}")
+    print(f"{'='*80}\n")
+
+
+def main():
+    """Loop principal."""
+    print("ðŸš€ Iniciando monitoramento Bling...")
+    print(f"â±ï¸  Intervalo entre execuÃ§Ãµes: {MINUTES_BETWEEN_RUNS} minutos\n")
+    
     try:
         while True:
-            loaded_tokens = load_tokens()
-            if loaded_tokens:
-                refresh_token = loaded_tokens['refresh_token']
-                try:
-                    refresh_access_token()
-                except requests.exceptions.HTTPError as e:
-                    print(f"Failed to refresh token: {e}. Please get a new AUTH_CODE.")
-                    # As a fallback, you could delete tokens.json and re-run
-            else:
-                try:
-                    get_initial_token()
-                except requests.exceptions.HTTPError as e:
-                    print(f"Failed to get initial token: {e}")
-                    print("Please ensure your AUTH_CODE is new and valid.")
-
-            if access_token:
-                find_and_deactivate_first_zero_stock_product()
-            else:
-                print("\nCould not obtain access token. Exiting.")
+            process_zero_stock_products()
             
-            print(f"\nWaiting for {MINUTES_BETWEEN_RUNS} minutes before next run...")
-            time.sleep(MINUTES_BETWEEN_RUNS * 60) # Convert minutes to seconds
-
+            print(f"â³ Aguardando {MINUTES_BETWEEN_RUNS} minutos atÃ© prÃ³xima execuÃ§Ã£o...")
+            print(f"   (Pressione Ctrl+C para interromper)\n")
+            
+            time.sleep(MINUTES_BETWEEN_RUNS * 60)
+    
     except KeyboardInterrupt:
-        print("\nScript interrupted by user. Exiting.")
+        print("\n\nðŸ›‘ Script interrompido pelo usuÃ¡rio. Encerrando...")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```
+File: D:\Projects\bling_monitor\webhook_server.py
+"""
+Servidor de webhooks Bling com validaÃ§Ã£o HMAC e processamento assÃ­ncrono
+"""
+from flask import Flask, request, jsonify
+import hmac
+import hashlib
+import os
+import threading
+import queue
+from dotenv import load_dotenv
+
+from bling_auth import ensure_authenticated
+from bling_api import BlingAPI
+from bling_db import BlingDatabase
+
+load_dotenv()
+
+app = Flask(__name__)
+
+# ConfiguraÃ§Ãµes
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", 5000))
+
+# Recursos
+api = BlingAPI(ensure_authenticated)
+db = BlingDatabase()
+
+# Fila de eventos
+event_queue = queue.Queue()
+
+
+def verify_hmac_signature(payload_bytes, signature):
+    """
+    Verifica assinatura HMAC-SHA256 do webhook.
+    
+    Args:
+        payload_bytes: Corpo da requisiÃ§Ã£o (bytes brutos)
+        signature: Header X-Bling-Signature-256
+    
+    Returns:
+        bool
+    """
+    expected = 'sha256=' + hmac.new(
+        CLIENT_SECRET.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+    
+    return hmac.compare_digest(signature, expected)
+
+
+@app.route('/webhook/bling', methods=['POST'])
+def webhook_handler():
+    """
+    Endpoint principal de recepÃ§Ã£o de webhooks.
+    DEVE responder em < 5 segundos.
+    """
+    # Validar assinatura HMAC
+    signature = request.headers.get('X-Bling-Signature-256', '')
+    
+    if not verify_hmac_signature(request.get_data(), signature):
+        print("âŒ Assinatura HMAC invÃ¡lida!")
+        return jsonify({"error": "Invalid signature"}), 401
+    
+    # Parsear payload
+    try:
+        payload = request.get_json()
+    except Exception as e:
+        print(f"âŒ Erro ao parsear JSON: {e}")
+        return jsonify({"error": "Invalid JSON"}), 400
+    
+    event_id = payload.get('eventId')
+    event_type = payload.get('event')
+    
+    if not event_id or not event_type:
+        print("âŒ Payload sem eventId ou event")
+        return jsonify({"error": "Missing eventId or event"}), 400
+    
+    # Verificar idempotÃªncia
+    if db.is_event_processed(event_id):
+        print(f"â„¹ï¸  Evento {event_id} jÃ¡ processado anteriormente (idempotÃªncia)")
+        return jsonify({"status": "already_processed"}), 200
+    
+    # Enfileirar para processamento assÃ­ncrono
+    event_queue.put(payload)
+    
+    print(f"âœ… Webhook recebido: {event_type} (eventId: {event_id})")
+    
+    # Responder rapidamente (<5s)
+    return jsonify({"status": "queued"}), 200
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de health check."""
+    stats = db.get_stats()
+    return jsonify({
+        "status": "healthy",
+        "queue_size": event_queue.qsize(),
+        "db_stats": stats
+    }), 200
+
+
+def process_stock_event(data):
+    """Processa evento de estoque (stock.updated)."""
+    from test import should_ignore_product, check_stock_depleted_by_sales
+    
+    product_info = data.get('produto', {})
+    product_id = product_info.get('id')
+    
+    if not product_id:
+        print("âš ï¸  Evento de estoque sem ID de produto")
+        return
+    
+    print(f"ðŸ“¦ Processando evento de estoque para produto {product_id}")
+    
+    try:
+        # Buscar produto completo
+        response = api.get_product(product_id)
+        product = response.get('data', {})
+        
+        # Verificar se deve ignorar
+        should_ignore, reason = should_ignore_product(product)
+        if should_ignore:
+            print(f"   â­ï¸  {reason}")
+            return
+        
+        # Verificar estoque
+        stock = product.get('estoque', {}).get('saldoVirtualTotal', 0)
+        
+        if stock > 0:
+            print(f"   âœ… Estoque > 0, nada a fazer")
+            return
+        
+        # Verificar se zerou por vendas
+        is_depleted, details = check_stock_depleted_by_sales(product_id)
+        
+        if is_depleted:
+            print(f"   ðŸ”´ Desativando produto (zerado por vendas)")
+            api.update_product_situation(product_id, 'I')
+            print(f"   âœ… Produto desativado")
+        else:
+            print(f"   â„¹ï¸  NÃ£o desativar: {details['reason']}")
+    
+    except Exception as e:
+        print(f"   âŒ Erro ao processar: {e}")
+
+
+def process_product_event(data):
+    """Processa evento de produto (product.created, product.updated)."""
+    from dump_products import should_generate_code, extract_category_info
+    
+    product_id = data.get('id')
+    
+    if not product_id:
+        print("âš ï¸  Evento de produto sem ID")
+        return
+    
+    print(f"ðŸ“¦ Processando evento de produto {product_id}")
+    
+    try:
+        # Se jÃ¡ tem cÃ³digo, ignora
+        if data.get('codigo'):
+            print(f"   â„¹ï¸  Produto jÃ¡ possui cÃ³digo: {data.get('codigo')}")
+            return
+        
+        # Buscar detalhes completos
+        response = api.get_product(product_id)
+        product = response.get('data', {})
+        
+        # Verificar se deve gerar cÃ³digo
+        should_gen, reason, prefix = should_generate_code(product)
+        
+        if not should_gen:
+            print(f"   â­ï¸  {reason}")
+            return
+        
+        # Gerar cÃ³digo
+        category, subcategory, full, cat_id = extract_category_info(product)
+        new_code = db.get_next_code(
+            prefix=prefix,
+            category_id=cat_id,
+            category_name=full
+        )
+        
+        print(f"   ðŸ·ï¸  Gerando cÃ³digo: {new_code}")
+        
+        # Atualizar produto
+        api.update_product(product_id, {"codigo": new_code})
+        print(f"   âœ… CÃ³digo atribuÃ­do com sucesso")
+    
+    except Exception as e:
+        print(f"   âŒ Erro ao processar: {e}")
+
+
+def event_processor_worker():
+    """Thread worker que processa eventos da fila."""
+    print("ðŸ”„ Worker de processamento iniciado")
+    
+    while True:
+        try:
+            # Pega evento da fila (bloqueante)
+            payload = event_queue.get(timeout=1)
+            
+            event_id = payload.get('eventId')
+            event_type = payload.get('event')
+            data = payload.get('data', {})
+            
+            print(f"\n{'â”€'*60}")
+            print(f"ðŸ”„ Processando evento: {event_type} (ID: {event_id})")
+            print(f"{'â”€'*60}")
+            
+            # Marcar como processado
+            product_id = data.get('id') or data.get('produto', {}).get('id')
+            db.mark_event_processed(event_id, event_type, product_id, payload)
+            
+            # Rotear para processador especÃ­fico
+            if event_type == 'stock.updated':
+                process_stock_event(data)
+            
+            elif event_type in ['product.created', 'product.updated']:
+                process_product_event(data)
+            
+            else:
+                print(f"âš ï¸  Tipo de evento desconhecido: {event_type}")
+            
+            event_queue.task_done()
+            print(f"âœ… Evento processado com sucesso\n")
+        
+        except queue.Empty:
+            continue
+        
+        except Exception as e:
+            print(f"âŒ Erro ao processar evento: {e}\n")
+
+
+def start_server():
+    """Inicia servidor de webhooks."""
+    print(f"\n{'='*80}")
+    print(f"ðŸš€ INICIANDO SERVIDOR DE WEBHOOKS BLING")
+    print(f"{'='*80}")
+    print(f"ðŸŒ Host: 0.0.0.0")
+    print(f"ðŸ”Œ Porta: {WEBHOOK_PORT}")
+    print(f"ðŸ“ Endpoint: http://your-domain.com/webhook/bling")
+    print(f"â¤ï¸  Health: http://your-domain.com/health")
+    print(f"{'='*80}\n")
+    
+    # Iniciar worker thread
+    worker_thread = threading.Thread(target=event_processor_worker, daemon=True)
+    worker_thread.start()
+    
+    # Iniciar Flask
+    app.run(
+        host='0.0.0.0',
+        port=WEBHOOK_PORT,
+        debug=False,
+        threaded=True
+    )
+
+
+if __name__ == '__main__':
+    start_server()
 ```
 
 
