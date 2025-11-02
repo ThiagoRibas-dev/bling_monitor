@@ -1,0 +1,19 @@
+## Estoque:
+Exemplo :
+	Categoria : Notebook
+	Estoque : > 0
+
+O que tem Estoque = 0 tem misturado maquina que nao teve entrada de estoque porque nao foi produzida e maquina que foi vendida e fcou sem estoque.
+
+Entao maquina que tem Estoque = 0 porque entradas = saida vinculada a venda, o regitro mude Situação para desativado.
+
+Não aplicar para caregorias Notebook, SFF, Mini, Monitor.
+
+Para categoria SubMaquina, pendente de teste.
+
+## Codigo :
+Notebook, Mini, SFF tudo Codigo NTBxxxx.
+Peças: Utilizar sub-categoria ao invés da categoria pai.
+SubMaquina: ignorar.
+
+Verificar o tempo de resposta do webhook.
