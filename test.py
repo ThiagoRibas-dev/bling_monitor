@@ -2,24 +2,31 @@
 Script de monitoramento contínuo - Desativa produtos com estoque zerado POR VENDAS
 """
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 import os
 
 # Imports dos novos módulos
 from bling_auth import ensure_authenticated
 from bling_api import BlingAPI
-from bling_utils import extract_category_info, should_ignore_product, check_stock_depleted_by_sales
+from bling_utils import (
+    get_category_cache,
+    should_ignore_product,
+    check_stock_depleted_by_sales
+)
 
 load_dotenv()
 
 # Configurações
-MINUTES_BETWEEN_RUNS = int(os.getenv("MINUTES_BETWEEN_RUNS", 60))  # Aumentado para 1h
-EXCLUDED_CATEGORIES = {"notebook", "sff", "mini", "monitor"}  # lowercase para comparação
-IGNORE_SUBCATEGORIES = {"submaquina"}  # lowercase
+MINUTES_BETWEEN_RUNS = int(os.getenv("MINUTES_BETWEEN_RUNS", 60))
+EXCLUDED_CATEGORIES = {"notebook", "sff", "mini", "monitor"}
+IGNORE_SUBCATEGORIES = {"submaquina"}
 
 # Cliente API
 api = BlingAPI(ensure_authenticated)
+
+# Cache de categorias (NOVO)
+category_cache = get_category_cache()
 
 
 def process_zero_stock_products():
@@ -29,6 +36,10 @@ def process_zero_stock_products():
     print(f"\n{'='*80}")
     print(f"🔍 INICIANDO VARREDURA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}\n")
+    
+    # Carregar cache de categorias (NOVO - só carrega uma vez)
+    if not category_cache.is_loaded():
+        category_cache.load(api)
     
     page = 1
     checked_count = 0
@@ -49,13 +60,13 @@ def process_zero_stock_products():
                 stock = p.get("estoqueAtual", 0)
                 
                 if stock != 0:
-                    continue  # Pula produtos com estoque
+                    continue
                 
                 zero_stock_count += 1
                 product_id = p.get("id")
                 product_name = p.get("nome", "Sem nome")
                 
-                print(f"\n📦 Produto com estoque ZERO encontrado:")
+                print("\n📦 Produto com estoque ZERO encontrado:")
                 print(f"   ID: {product_id}")
                 print(f"   Nome: {product_name}")
                 
@@ -67,15 +78,21 @@ def process_zero_stock_products():
                     print(f"   ❌ Erro ao buscar detalhes: {e}")
                     continue
                 
-                # Verificar se deve ignorar
-                should_ignore, ignore_reason = should_ignore_product(product_details, EXCLUDED_CATEGORIES, IGNORE_SUBCATEGORIES)
+                # Verificar se deve ignorar (ATUALIZADO - passa o cache)
+                should_ignore, ignore_reason = should_ignore_product(
+                    product_details, 
+                    category_cache,
+                    EXCLUDED_CATEGORIES,
+                    IGNORE_SUBCATEGORIES
+                )
+                
                 if should_ignore:
                     ignored_count += 1
                     print(f"   ⏭️  IGNORADO: {ignore_reason}")
                     continue
                 
                 # Verificar se zerou por vendas
-                print(f"   🔍 Verificando movimentações de estoque...")
+                print("   🔍 Verificando movimentações de estoque...")
                 is_depleted, details = check_stock_depleted_by_sales(api, product_id)
                 
                 print(f"   📊 Entradas: {details['entries']}")
@@ -83,15 +100,15 @@ def process_zero_stock_products():
                 print(f"   📊 Motivo: {details['reason']}")
                 
                 if is_depleted:
-                    print(f"   🔴 DESATIVANDO produto...")
+                    print("   🔴 DESATIVANDO produto...")
                     try:
                         api.update_product_situation(product_id, 'I')
                         deactivated_count += 1
-                        print(f"   ✅ Produto DESATIVADO com sucesso")
+                        print("   ✅ Produto DESATIVADO com sucesso")
                     except Exception as e:
                         print(f"   ❌ Erro ao desativar: {e}")
                 else:
-                    print(f"   ✅ Produto NÃO será desativado (não zerou por vendas)")
+                    print("   ✅ Produto NÃO será desativado (não zerou por vendas)")
             
             print(f"\n📄 Página {page} processada ({len(products)} produtos)")
             page += 1
@@ -102,7 +119,7 @@ def process_zero_stock_products():
     
     # Relatório final
     print(f"\n{'='*80}")
-    print(f"📊 RELATÓRIO FINAL")
+    print("📊 RELATÓRIO FINAL")
     print(f"{'='*80}")
     print(f"✅ Produtos verificados: {checked_count}")
     print(f"⚠️  Com estoque zero: {zero_stock_count}")
@@ -121,7 +138,7 @@ def main():
             process_zero_stock_products()
             
             print(f"⏳ Aguardando {MINUTES_BETWEEN_RUNS} minutos até próxima execução...")
-            print(f"   (Pressione Ctrl+C para interromper)\n")
+            print("   (Pressione Ctrl+C para interromper)\n")
             
             time.sleep(MINUTES_BETWEEN_RUNS * 60)
     

@@ -47,11 +47,11 @@ def test_database():
         assert db.is_event_processed("test_event_123"), "Evento deveria estar marcado"
         assert not db.is_event_processed("test_event_999"), "Evento não deveria estar marcado"
         
-        print(f"✅ Banco funcionando corretamente")
+        print("✅ Banco funcionando corretamente")
         
         # Mostra stats
         stats = db.get_stats()
-        print(f"\n📊 Estatísticas:")
+        print("\n📊 Estatísticas:")
         print(f"   Contadores: {stats['counters']}")
         print(f"   Eventos: {stats['events']}")
         

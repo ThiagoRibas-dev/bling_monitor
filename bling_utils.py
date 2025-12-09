@@ -4,17 +4,83 @@ Funções utilitárias compartilhadas entre módulos
 from datetime import datetime, timedelta
 
 
-def extract_category_info(product):
+class CategoryCache:
+    """Cache de categorias carregadas da API."""
+    
+    def __init__(self):
+        self._categories = {}  # ID -> categoria completa
+        self._loaded = False
+    
+    def load(self, api):
+        """Carrega todas as categorias da API."""
+        if self._loaded:
+            return
+        
+        print("Carregando cache de categorias...")
+        self._categories = api.get_all_categories()
+        self._loaded = True
+        print(f"✅ {len(self._categories)} categorias em cache")
+    
+    def get_by_id(self, category_id):
+        """Obtém categoria por ID."""
+        return self._categories.get(category_id)
+    
+    def get_name(self, category_id):
+        """Obtém nome da categoria por ID."""
+        cat = self._categories.get(category_id)
+        
+        if not cat:
+            ''
+        if cat.get('nome', ''):
+            return cat.get('nome', '')
+        
+        if cat.get('descricao', ''):
+            return cat.get('descricao', '')
+        
+        return ''
+    
+    def is_loaded(self):
+        """Verifica se cache foi carregado."""
+        return self._loaded
+
+
+# Instância global do cache
+_category_cache = CategoryCache()
+
+
+def get_category_cache():
+    """Retorna a instância global do cache."""
+    return _category_cache
+
+
+def extract_category_info(product, category_cache=None):
     """
     Extrai categoria e subcategoria de um produto.
+    
+    Args:
+        product: Dicionário do produto
+        category_cache: Instância de CategoryCache (opcional)
     
     Returns:
         (category_name, subcategory_name, full_hierarchy, category_id)
     """
     cat_info = product.get('categoria', {})
     cat_id = cat_info.get('id')
-    full_name = cat_info.get('nome', '')
     
+    if not cat_id:
+        return None, None, None, None
+    
+    # Tentar obter nome do cache primeiro
+    if category_cache:
+        full_name = category_cache.get_name(cat_id)
+    else:
+        # Fallback: tentar obter do próprio produto (pode não existir)
+        full_name = cat_info.get('nome', '')
+    
+    if not full_name:
+        return None, None, None, cat_id
+    
+    # Extrair hierarquia (Categoria>>Subcategoria)
     if '>>' in full_name:
         parts = full_name.split('>>')
         category = parts[0].strip()
@@ -24,20 +90,25 @@ def extract_category_info(product):
         return full_name, None, full_name, cat_id
 
 
-def should_ignore_product(product, excluded_categories={'notebook', 'sff', 'mini', 'monitor'}, 
+def should_ignore_product(product, category_cache=None,
+                         excluded_categories={'notebook', 'sff', 'mini', 'monitor'}, 
                          ignore_subcategories={'submaquina'}):
     """
     Verifica se produto deve ser ignorado baseado em categoria.
     
     Args:
         product: Dicionário do produto
+        category_cache: Instância de CategoryCache
         excluded_categories: Set de categorias a excluir (lowercase)
         ignore_subcategories: Set de subcategorias a ignorar (lowercase)
     
     Returns:
         (should_ignore: bool, reason: str)
     """
-    category, subcategory, full, _ = extract_category_info(product)
+    category, subcategory, full, cat_id = extract_category_info(product, category_cache)
+    
+    if not category:
+        return False, "Sem categoria ou categoria não encontrada no cache"
     
     # Verificar categorias excluídas
     if category.lower() in excluded_categories:
@@ -149,9 +220,13 @@ def get_category_prefix(category_name):
         return clean_name[:4].upper()
 
 
-def should_generate_code(product):
+def should_generate_code(product, category_cache=None):
     """
     Verifica se deve gerar código para o produto.
+    
+    Args:
+        product: Dicionário do produto
+        category_cache: Instância de CategoryCache
     
     Returns:
         (should_generate: bool, reason: str, prefix: str)
@@ -160,10 +235,10 @@ def should_generate_code(product):
     if product.get('codigo'):
         return False, "Ja possui codigo", None
     
-    category, subcategory, full, cat_id = extract_category_info(product)
+    category, subcategory, full, cat_id = extract_category_info(product, category_cache)
     
     if not category:
-        return False, "Sem categoria", None
+        return False, "Sem categoria ou categoria nao encontrada", None
     
     # SubMaquina: ignorar
     if subcategory and subcategory.lower() == 'submaquina':

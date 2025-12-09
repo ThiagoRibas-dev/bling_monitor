@@ -118,5 +118,7 @@ def ensure_authenticated():
     """Ensures valid authentication, returns access token."""
     try:
         return get_access_token()
-    except:
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        print("🔄 Attempting to refresh token...")
         return refresh_access_token()['access_token']

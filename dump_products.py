@@ -2,18 +2,24 @@
 Script de geração de códigos para produtos - COM PERSISTÊNCIA
 """
 import json
-import time
 from datetime import datetime
 
 # Imports dos novos módulos
 from bling_auth import ensure_authenticated
 from bling_api import BlingAPI
 from bling_db import BlingDatabase
-from bling_utils import extract_category_info, get_category_prefix, should_generate_code
+from bling_utils import (
+    get_category_cache,
+    extract_category_info,
+    should_generate_code
+)
 
 # Cliente API e Database
 api = BlingAPI(ensure_authenticated)
 db = BlingDatabase()
+
+# Cache de categorias (NOVO)
+category_cache = get_category_cache()
 
 OUTPUT_FILE = "products_dump.json"
 
@@ -26,15 +32,15 @@ def generate_and_update_code(product, product_details):
         (success: bool, code: str or None, message: str)
     """
     product_id = product['id']
-    product_name = product.get('nome', 'Sem nome')
     
-    should_gen, reason, prefix = should_generate_code(product_details)
+    # Passa o cache para should_generate_code (ATUALIZADO)
+    should_gen, reason, prefix = should_generate_code(product_details, category_cache)
     
     if not should_gen:
         return False, None, reason
     
     # Gerar código usando banco de dados (thread-safe)
-    category, subcategory, full, cat_id = extract_category_info(product_details)
+    category, subcategory, full, cat_id = extract_category_info(product_details, category_cache)
     new_code = db.get_next_code(
         prefix=prefix,
         category_id=cat_id,
@@ -74,14 +80,14 @@ def process_product_variations(product_details):
         print(f"      🔍 Processando variação: {var_name}")
         
         # Variações herdam categoria do produto pai
-        should_gen, reason, prefix = should_generate_code(product_details)
+        should_gen, reason, prefix = should_generate_code(product_details, category_cache)
         
         if not should_gen:
             print(f"      ⏭️  {reason}")
             continue
         
         # Gerar código
-        category, subcategory, full, cat_id = extract_category_info(product_details)
+        category, subcategory, full, cat_id = extract_category_info(product_details, category_cache)
         new_code = db.get_next_code(
             prefix=prefix,
             category_id=cat_id,
@@ -92,10 +98,9 @@ def process_product_variations(product_details):
         
         # Atualizar variação
         try:
-            # Endpoint de variações
             api.update_product(var_id, {"codigo": new_code})
-            var['codigo'] = new_code  # Atualiza no dump também
-            print(f"      ✅ Variação atualizada com sucesso")
+            var['codigo'] = new_code
+            print("      ✅ Variação atualizada com sucesso")
         except Exception as e:
             print(f"      ❌ Erro ao atualizar variação: {e}")
 
@@ -107,6 +112,9 @@ def dump_and_update_product_codes():
     print(f"\n{'='*80}")
     print(f"🚀 INICIANDO GERAÇÃO DE CÓDIGOS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}\n")
+    
+    # Carregar cache de categorias (NOVO - CRÍTICO!)
+    category_cache.load(api)
     
     all_products = []
     page = 1
@@ -150,7 +158,7 @@ def dump_and_update_product_codes():
                 
                 if success:
                     print(f"    ✅ {message}")
-                    product_details['codigo'] = code  # Atualiza no dump
+                    product_details['codigo'] = code
                     total_updated += 1
                 else:
                     print(f"    ⏭️  {message}")
@@ -174,7 +182,7 @@ def dump_and_update_product_codes():
     
     # Relatório final
     print(f"\n{'='*80}")
-    print(f"📊 RELATÓRIO FINAL")
+    print("📊 RELATÓRIO FINAL")
     print(f"{'='*80}")
     print(f"✅ Produtos processados: {total_processed}")
     print(f"🏷️  Códigos gerados e atualizados: {total_updated}")
@@ -185,10 +193,10 @@ def dump_and_update_product_codes():
     
     # Estatísticas do banco
     stats = db.get_stats()
-    print(f"📊 ESTATÍSTICAS DO BANCO DE DADOS")
+    print("📊 ESTATÍSTICAS DO BANCO DE DADOS")
     print(f"{'='*80}")
     print(f"Contadores de código cadastrados: {stats['counters']}")
-    print(f"\nÚltimos contadores usados:")
+    print("\nÚltimos contadores usados:")
     for counter in stats['recent_counters'][:5]:
         print(f"  • {counter['prefix']}: {counter['last_value']:05d} ({counter['category_name']})")
     print(f"{'='*80}\n")

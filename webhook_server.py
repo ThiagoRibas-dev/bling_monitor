@@ -134,16 +134,16 @@ def process_stock_event(data):
         stock = product.get('estoque', {}).get('saldoVirtualTotal', 0)
         
         if stock > 0:
-            print(f"   ✅ Estoque > 0, nada a fazer")
+            print("   ✅ Estoque > 0, nada a fazer")
             return
         
         # Verificar se zerou por vendas
         is_depleted, details = check_stock_depleted_by_sales(api, product_id)
         
         if is_depleted:
-            print(f"   🔴 Desativando produto (zerado por vendas)")
+            print("   🔴 Desativando produto (zerado por vendas)")
             api.update_product_situation(product_id, 'I')
-            print(f"   ✅ Produto desativado")
+            print("   ✅ Produto desativado")
         else:
             print(f"   ℹ️  Não desativar: {details['reason']}")
     
@@ -191,7 +191,7 @@ def process_product_event(data):
         
         # Atualizar produto
         api.update_product(product_id, {"codigo": new_code})
-        print(f"   ✅ Código atribuído com sucesso")
+        print("   ✅ Código atribuído com sucesso")
     
     except Exception as e:
         print(f"   ❌ Erro ao processar: {e}")
@@ -229,7 +229,7 @@ def event_processor_worker():
                 print(f"⚠️  Tipo de evento desconhecido: {event_type}")
             
             event_queue.task_done()
-            print(f"✅ Evento processado com sucesso\n")
+            print("✅ Evento processado com sucesso\n")
         
         except queue.Empty:
             continue
@@ -241,12 +241,12 @@ def event_processor_worker():
 def start_server():
     """Inicia servidor de webhooks."""
     print(f"\n{'='*80}")
-    print(f"🚀 INICIANDO SERVIDOR DE WEBHOOKS BLING")
+    print("🚀 INICIANDO SERVIDOR DE WEBHOOKS BLING")
     print(f"{'='*80}")
-    print(f"🌐 Host: 0.0.0.0")
+    print("🌐 Host: 0.0.0.0")
     print(f"🔌 Porta: {WEBHOOK_PORT}")
-    print(f"📍 Endpoint: http://your-domain.com/webhook/bling")
-    print(f"❤️  Health: http://your-domain.com/health")
+    print("📍 Endpoint: http://your-domain.com/webhook/bling")
+    print("❤️  Health: http://your-domain.com/health")
     print(f"{'='*80}\n")
     
     # Iniciar worker thread

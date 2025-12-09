@@ -29,7 +29,7 @@ class RateLimiter:
         if datetime.now() >= self.daily_reset:
             self.daily_count = 0
             self.daily_reset = datetime.now() + timedelta(days=1)
-            print(f"📊 Rate limit diário resetado")
+            print("📊 Rate limit diário resetado")
         
         # Verifica limite diário
         if self.daily_count >= self.rpd:
