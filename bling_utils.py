@@ -2,6 +2,7 @@
 Funções utilitárias compartilhadas entre módulos
 """
 from datetime import datetime, timedelta
+from bling_logger import log
 
 
 class CategoryCache:
@@ -16,10 +17,10 @@ class CategoryCache:
         if self._loaded:
             return
         
-        print("Carregando cache de categorias...")
+        log.info("Carregando cache de categorias...")
         self._categories = api.get_all_categories()
         self._loaded = True
-        print(f"✅ {len(self._categories)} categorias em cache")
+        log.info(f"✅ {len(self._categories)} categorias em cache")
     
     def get_by_id(self, category_id):
         """Obtém categoria por ID."""
@@ -30,7 +31,8 @@ class CategoryCache:
         cat = self._categories.get(category_id)
         
         if not cat:
-            ''
+            return  ''
+            
         if cat.get('nome', ''):
             return cat.get('nome', '')
         
@@ -64,7 +66,7 @@ def extract_category_info(product, category_cache=None):
     Returns:
         (category_name, subcategory_name, full_hierarchy, category_id)
     """
-    cat_info = product.get('categoria', {})
+    cat_info = product.get('categoria', '')
     cat_id = cat_info.get('id')
     
     if not cat_id:
@@ -183,7 +185,7 @@ def check_stock_depleted_by_sales(api, product_id):
         }
     
     except Exception as e:
-        print(f"    Erro ao verificar movimentacoes: {e}")
+        log.error(f"    Erro ao verificar movimentacoes para o produto ID {product_id}: {e}")
         return False, {'reason': f'Erro: {e}', 'entries': 0, 'sales_exits': 0}
 
 

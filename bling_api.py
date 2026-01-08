@@ -5,6 +5,7 @@ import requests
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from bling_logger import log
 
 
 class RateLimiter:
@@ -29,12 +30,12 @@ class RateLimiter:
         if datetime.now() >= self.daily_reset:
             self.daily_count = 0
             self.daily_reset = datetime.now() + timedelta(days=1)
-            print("📊 Rate limit diário resetado")
+            log.info("📊 Rate limit diário resetado")
         
         # Verifica limite diário
         if self.daily_count >= self.rpd:
             wait_seconds = (self.daily_reset - datetime.now()).total_seconds()
-            print(f"⚠️ Limite diário atingido! Aguardando {wait_seconds/3600:.1f} horas...")
+            log.warning(f"⚠️ Limite diário atingido! Aguardando {wait_seconds/3600:.1f} horas...")
             time.sleep(wait_seconds)
             self.daily_count = 0
         
@@ -102,7 +103,7 @@ class BlingAPI:
                 # Tratar erros HTTP
                 if response.status_code == 401:
                     # Token expirado, força refresh e tenta de novo
-                    print("⚠️ Token expirado (401), tentando refresh...")
+                    log.warning("⚠️ Token expirado (401), tentando refresh...")
                     from bling_auth import refresh_access_token
                     refresh_access_token()
                     # Retry com novo token (não conta como tentativa)
@@ -111,7 +112,7 @@ class BlingAPI:
                 elif response.status_code == 429:
                     # Rate limit excedido
                     retry_after = int(response.headers.get('Retry-After', 60))
-                    print(f"⏳ Rate limit (429). Aguardando {retry_after}s...")
+                    log.warning(f"⏳ Rate limit (429). Aguardando {retry_after}s...")
                     time.sleep(retry_after)
                     continue
                 
@@ -119,7 +120,7 @@ class BlingAPI:
                     # Erro do servidor, retry com backoff
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt  # 1s, 2s, 4s
-                        print(f"⚠️ Erro {response.status_code}. Retry {attempt+1}/{max_retries} em {wait}s...")
+                        log.warning(f"⚠️ Erro de servidor {response.status_code}. Tentando novamente em {wait}s... (tentativa {attempt+1}/{max_retries})")
                         time.sleep(wait)
                         continue
                 
@@ -132,19 +133,22 @@ class BlingAPI:
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    print(f"⏱️ Timeout. Retry {attempt+1}/{max_retries} em {wait}s...")
+                    log.warning(f"⏱️ Timeout. Tentando novamente em {wait}s... (tentativa {attempt+1}/{max_retries})")
                     time.sleep(wait)
                     continue
+                log.error("❌ Request falhou por timeout após múltiplas tentativas.")
                 raise
             
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    print(f"⚠️ Erro de rede: {e}. Retry {attempt+1}/{max_retries} em {wait}s...")
+                    log.warning(f"⚠️ Erro de rede: {e}. Tentando novamente em {wait}s... (tentativa {attempt+1}/{max_retries})")
                     time.sleep(wait)
                     continue
+                log.error(f"❌ Request falhou por erro de rede: {e}")
                 raise
         
+        log.error(f"❌ Request para {endpoint} falhou após {max_retries} tentativas.")
         raise Exception(f"Falhou após {max_retries} tentativas")
     
     # === Produtos ===
@@ -199,7 +203,6 @@ class BlingAPI:
             
             page += 1
         
-        print(f"📦 {len(all_cats)} categorias carregadas")
         return all_cats
     
     # === Estoque ===

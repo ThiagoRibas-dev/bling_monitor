@@ -2,16 +2,18 @@
 Script de geração de códigos para produtos - COM PERSISTÊNCIA
 """
 import json
-from datetime import datetime
 
 # Imports dos novos módulos
+from bling_logger import log
 from bling_auth import ensure_authenticated
 from bling_api import BlingAPI
 from bling_db import BlingDatabase
 from bling_utils import (
     get_category_cache,
     extract_category_info,
-    should_generate_code
+    should_generate_code,
+    should_ignore_product,
+    check_stock_depleted_by_sales,
 )
 
 # Cliente API e Database
@@ -20,6 +22,10 @@ db = BlingDatabase()
 
 # Cache de categorias (NOVO)
 category_cache = get_category_cache()
+
+# Configurações de desativação (importado de test.py)
+EXCLUDED_CATEGORIES = {"notebook", "sff", "mini", "monitor"}
+IGNORE_SUBCATEGORIES = {"submaquina"}
 
 OUTPUT_FILE = "products_dump.json"
 
@@ -47,13 +53,14 @@ def generate_and_update_code(product, product_details):
         category_name=full
     )
     
-    print(f"   🏷️  Código gerado: {new_code}")
+    log.info(f"   🏷️  Código gerado: {new_code}")
     
     # Atualizar na API
     try:
         api.update_product(product_id, {"codigo": new_code})
         return True, new_code, f"Atualizado com sucesso ({reason})"
     except Exception as e:
+        log.error(f"Erro ao atualizar produto {product_id}: {e}")
         return False, None, f"Erro ao atualizar: {e}"
 
 
@@ -66,7 +73,7 @@ def process_product_variations(product_details):
     if not variations:
         return
     
-    print(f"   🔀 Produto tem {len(variations)} variações")
+    log.info(f"   🔀 Produto tem {len(variations)} variações")
     
     for var in variations:
         var_id = var.get('id')
@@ -74,16 +81,16 @@ def process_product_variations(product_details):
         var_code = var.get('codigo')
         
         if var_code:
-            print(f"      ⏭️  Variação {var_id} já tem código: {var_code}")
+            log.info(f"      ⏭️  Variação {var_id} já tem código: {var_code}")
             continue
         
-        print(f"      🔍 Processando variação: {var_name}")
+        log.info(f"      🔍 Processando variação: {var_name}")
         
         # Variações herdam categoria do produto pai
         should_gen, reason, prefix = should_generate_code(product_details, category_cache)
         
         if not should_gen:
-            print(f"      ⏭️  {reason}")
+            log.info(f"      ⏭️  {reason}")
             continue
         
         # Gerar código
@@ -94,34 +101,38 @@ def process_product_variations(product_details):
             category_name=full
         )
         
-        print(f"      🏷️  Código gerado para variação: {new_code}")
+        log.info(f"      🏷️  Código gerado para variação: {new_code}")
         
         # Atualizar variação
         try:
             api.update_product(var_id, {"codigo": new_code})
             var['codigo'] = new_code
-            print("      ✅ Variação atualizada com sucesso")
+            log.info("      ✅ Variação atualizada com sucesso")
         except Exception as e:
-            print(f"      ❌ Erro ao atualizar variação: {e}")
+            log.error(f"      ❌ Erro ao atualizar variação {var_id}: {e}")
 
 
-def dump_and_update_product_codes():
+def dump_update_and_deactivate_products():
     """
-    Varre todos os produtos, gera códigos e atualiza na API.
+    Varre todos os produtos para:
+    1. Gerar códigos para produtos e variações sem código.
+    2. Desativar produtos com estoque zerado por vendas.
     """
-    print(f"\n{'='*80}")
-    print(f"🚀 INICIANDO GERAÇÃO DE CÓDIGOS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*80}\n")
-    
-    # Carregar cache de categorias (NOVO - CRÍTICO!)
+    log.info(f"{'='*80}")
+    log.info("🚀 INICIANDO PROCESSAMENTO DE PRODUTOS")
+    log.info(f"{'='*80}")
+
+    # Carregar cache de categorias (CRÍTICO!)
     category_cache.load(api)
-    
+
     all_products = []
     page = 1
     total_processed = 0
     total_updated = 0
     total_skipped = 0
     total_errors = 0
+    deactivated_count = 0
+    ignored_count = 0
     
     while True:
         try:
@@ -131,24 +142,23 @@ def dump_and_update_product_codes():
             if not products:
                 break
             
-            print(f"\n{'─'*80}")
-            print(f"📄 Processando página {page} ({len(products)} produtos)")
-            print(f"{'─'*80}\n")
+            log.info(f"{'─'*80}")
+            log.info(f"📄 Processando página {page} ({len(products)} produtos)")
+            log.info(f"{'─'*80}")
             
             for product_summary in products:
                 total_processed += 1
                 product_id = product_summary['id']
                 product_name = product_summary.get('nome', 'Sem nome')
                 
-                print(f"\n[{total_processed}] 📦 {product_name}")
-                print(f"    ID: {product_id}")
+                log.info(f"[{total_processed}] 📦 {product_name} (ID: {product_id})")
                 
                 # Buscar detalhes completos
                 try:
                     details_response = api.get_product(product_id)
                     product_details = details_response.get('data', {})
                 except Exception as e:
-                    print(f"    ❌ Erro ao buscar detalhes: {e}")
+                    log.error(f"    ❌ Erro ao buscar detalhes para o produto ID {product_id}: {e}")
                     total_errors += 1
                     all_products.append(product_summary)
                     continue
@@ -157,50 +167,103 @@ def dump_and_update_product_codes():
                 success, code, message = generate_and_update_code(product_summary, product_details)
                 
                 if success:
-                    print(f"    ✅ {message}")
+                    log.info(f"    ✅ {message}")
                     product_details['codigo'] = code
                     total_updated += 1
                 else:
-                    print(f"    ⏭️  {message}")
+                    log.info(f"    ⏭️  {message}")
                     total_skipped += 1
                 
                 # Processar variações
                 process_product_variations(product_details)
-                
+
+                # Checar estoque e desativar se necessário (lógica de test.py)
+                stock = product_details.get("estoqueAtual", 0)
+
+                if stock <= 0:
+                    log.info("   📉 Estoque zerado ou negativo encontrado.")
+                    # Verificar se deve ignorar
+                    should_ignore, ignore_reason = should_ignore_product(
+                        product_details,
+                        category_cache,
+                        EXCLUDED_CATEGORIES,
+                        IGNORE_SUBCATEGORIES,
+                    )
+
+                    if should_ignore:
+                        ignored_count += 1
+                        log.info(f"   ⏭️  IGNORADO para desativação: {ignore_reason}")
+                    else:
+                        # Verificar se zerou por vendas
+                        log.info("   🔍 Verificando movimentações de estoque...")
+                        is_depleted, details = check_stock_depleted_by_sales(api, product_id)
+
+                        log.info(f"   📊 Entradas: {details['entries']}")
+                        log.info(f"   📊 Saídas por venda: {details['sales_exits']}")
+                        log.info(f"   📊 Motivo: {details['reason']}")
+
+                        if is_depleted:
+                            # Somente desativa se o produto estiver ativo
+                            if product_details.get("situacao") == "A":
+                                log.warning("   🔴 DESATIVANDO produto...")
+                                try:
+                                    api.update_product_situation(product_id, "I")
+                                    deactivated_count += 1
+                                    product_details["situacao"] = "I"  # Atualiza estado local
+                                    log.info("   ✅ Produto DESATIVADO com sucesso")
+                                except Exception as e:
+                                    log.error(f"   ❌ Erro ao desativar produto {product_id}: {e}")
+                                    total_errors += 1
+                            else:
+                                log.info("   ✅ Produto já estava INATIVO.")
+                        else:
+                            log.info("   ✅ Produto NÃO será desativado (não zerou por vendas)")
+
                 all_products.append(product_details)
             
             page += 1
         
         except Exception as e:
-            print(f"\n❌ Erro na página {page}: {e}")
+            log.error(f"❌ Erro fatal na página {page}: {e}")
             break
     
     # Salvar dump
-    print(f"\n💾 Salvando dump em {OUTPUT_FILE}...")
+    log.info(f"💾 Salvando dump em {OUTPUT_FILE}...")
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(all_products, f, ensure_ascii=False, indent=2)
-    
+
     # Relatório final
-    print(f"\n{'='*80}")
-    print("📊 RELATÓRIO FINAL")
-    print(f"{'='*80}")
-    print(f"✅ Produtos processados: {total_processed}")
-    print(f"🏷️  Códigos gerados e atualizados: {total_updated}")
-    print(f"⏭️  Ignorados (já tinham código/regra): {total_skipped}")
-    print(f"❌ Erros: {total_errors}")
-    print(f"💾 Dump salvo: {OUTPUT_FILE}")
-    print(f"{'='*80}\n")
-    
+    log.info(f"{'='*80}")
+    log.info("📊 RELATÓRIO FINAL")
+    log.info(f"{'='*80}")
+    log.info("--- Geração de Códigos ---")
+    log.info(f"✅ Produtos processados: {total_processed}")
+    log.info(f"🏷️  Códigos gerados/atualizados: {total_updated}")
+    log.info(f"⏭️  Ignorados (código existente/regra): {total_skipped}")
+    log.info("--- Desativação de Produtos ---")
+    log.info(f"🔴 Desativados (zerado por vendas): {deactivated_count}")
+    log.info(f"⏭️  Ignorados para desativação (categoria): {ignored_count}")
+    log.info("--- Resumo ---")
+    log.info(f"❌ Erros totais (API/DB): {total_errors}")
+    log.info(f"💾 Dump salvo em: {OUTPUT_FILE}")
+    log.info(f"{'='*80}")
+
     # Estatísticas do banco
     stats = db.get_stats()
-    print("📊 ESTATÍSTICAS DO BANCO DE DADOS")
-    print(f"{'='*80}")
-    print(f"Contadores de código cadastrados: {stats['counters']}")
-    print("\nÚltimos contadores usados:")
-    for counter in stats['recent_counters'][:5]:
-        print(f"  • {counter['prefix']}: {counter['last_value']:05d} ({counter['category_name']})")
-    print(f"{'='*80}\n")
+    log.info("📊 ESTATÍSTICAS DO BANCO DE DADOS (Contadores de Código)")
+    log.info(f"{'='*80}")
+    log.info(f"Contadores de código cadastrados: {stats['counters']}")
+    if stats['recent_counters']:
+        log.info("Últimos contadores usados:")
+        for counter in stats['recent_counters'][:5]:
+            log.info(f"  • {counter['prefix']}: {counter['last_value']:05d} ({counter['category_name']})")
+    log.info(f"{'='*80}")
 
 
 if __name__ == "__main__":
-    dump_and_update_product_codes()
+    try:
+        dump_update_and_deactivate_products()
+    except Exception as e:
+        log.error(f"❌ Erro fatal {e}")
+
+    input("Pressione Enter para sair...")

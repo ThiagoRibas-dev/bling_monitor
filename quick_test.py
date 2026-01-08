@@ -4,34 +4,35 @@ Script de teste rápido para validar módulos
 from bling_auth import ensure_authenticated
 from bling_api import BlingAPI
 from bling_db import BlingDatabase
+from bling_logger import log
 
 def test_auth():
     """Testa autenticação."""
-    print("🔑 Testando autenticação...")
+    log.info("🔑 Testando autenticação...")
     try:
         token = ensure_authenticated()
-        print(f"✅ Token obtido: {token[:20]}...")
+        log.info(f"✅ Token obtido: {token[:20]}...")
         return True
     except Exception as e:
-        print(f"❌ Erro: {e}")
+        log.error(f"❌ Erro: {e}")
         return False
 
 def test_api():
     """Testa chamada à API."""
-    print("\n📡 Testando API...")
+    log.info("📡 Testando API...")
     try:
         api = BlingAPI(ensure_authenticated)
         data = api.get_products(page=1, limit=1)
         products = data.get('data', [])
-        print(f"✅ API funcionando. {len(products)} produto(s) retornado(s)")
+        log.info(f"✅ API funcionando. {len(products)} produto(s) retornado(s)")
         return True
     except Exception as e:
-        print(f"❌ Erro: {e}")
+        log.error(f"❌ Erro: {e}")
         return False
 
 def test_database():
     """Testa banco de dados."""
-    print("\n💾 Testando banco de dados...")
+    log.info("💾 Testando banco de dados...")
     try:
         db = BlingDatabase()
         
@@ -47,23 +48,23 @@ def test_database():
         assert db.is_event_processed("test_event_123"), "Evento deveria estar marcado"
         assert not db.is_event_processed("test_event_999"), "Evento não deveria estar marcado"
         
-        print("✅ Banco funcionando corretamente")
+        log.info("✅ Banco funcionando corretamente")
         
         # Mostra stats
         stats = db.get_stats()
-        print("\n📊 Estatísticas:")
-        print(f"   Contadores: {stats['counters']}")
-        print(f"   Eventos: {stats['events']}")
+        log.info("📊 Estatísticas:")
+        log.info(f"   Contadores: {stats['counters']}")
+        log.info(f"   Eventos: {stats['events']}")
         
         return True
     except Exception as e:
-        print(f"❌ Erro: {e}")
+        log.error(f"❌ Erro: {e}")
         return False
 
 if __name__ == "__main__":
-    print("="*60)
-    print("🧪 TESTE DE VALIDAÇÃO DOS MÓDULOS")
-    print("="*60 + "\n")
+    log.info("="*60)
+    log.info("🧪 TESTE DE VALIDAÇÃO DOS MÓDULOS")
+    log.info("="*60)
     
     results = {
         "Autenticação": test_auth(),
@@ -71,19 +72,19 @@ if __name__ == "__main__":
         "Database": test_database()
     }
     
-    print("\n" + "="*60)
-    print("📊 RESULTADO DOS TESTES")
-    print("="*60)
+    log.info("="*60)
+    log.info("📊 RESULTADO DOS TESTES")
+    log.info("="*60)
     
     for test, passed in results.items():
         status = "✅ PASSOU" if passed else "❌ FALHOU"
-        print(f"{test}: {status}")
+        log.info(f"{test}: {status}")
     
     all_passed = all(results.values())
     
-    print("="*60)
+    log.info("="*60)
     if all_passed:
-        print("🎉 TODOS OS TESTES PASSARAM!")
+        log.info("🎉 TODOS OS TESTES PASSARAM!")
     else:
-        print("⚠️  ALGUNS TESTES FALHARAM")
-    print("="*60)
+        log.warning("⚠️  ALGUNS TESTES FALHARAM")
+    log.info("="*60)
