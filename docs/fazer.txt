@@ -5,7 +5,7 @@ Exemplo :
 
 O que tem Estoque = 0 tem misturado maquina que nao teve entrada de estoque porque nao foi produzida e maquina que foi vendida e fcou sem estoque.
 
-Entao maquina que tem Estoque = 0 porque entradas = saida vinculada a venda, o regitro mude Situação para desativado.
+Entao maquina que tem Estoque = 0 porque entradas = saida vinculada a venda, mude Situação do registro para desativado.
 
 Não aplicar para caregorias Notebook, SFF, Mini, Monitor.
 
